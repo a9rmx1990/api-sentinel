@@ -1,0 +1,133 @@
+name: api-sentinel-production
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: sentinel
+      POSTGRES_USER: sentinel_admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}
+    volumes:
+      - sentinel-production-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel_admin -d sentinel"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - sentinel-production-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  runtime-role:
+    image: postgres:17-alpine
+    entrypoint: ["/bin/sh"]
+    command:
+      - "-ec"
+      - |
+        if ! psql --host postgres --username sentinel_admin --dbname sentinel -tAc "SELECT 1 FROM pg_roles WHERE rolname='sentinel_app'" | grep -q 1; then
+          psql --host postgres --username sentinel_admin --dbname sentinel --set=ON_ERROR_STOP=1 -c "CREATE ROLE sentinel_app LOGIN PASSWORD '$${APP_DB_PASSWORD}' NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;"
+        fi
+        psql --host postgres --username sentinel_admin --dbname sentinel --set=ON_ERROR_STOP=1 -c "GRANT CONNECT ON DATABASE sentinel TO sentinel_app;"
+    environment:
+      PGPASSWORD: ${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?Set APP_DB_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel_admin:${POSTGRES_ADMIN_PASSWORD}@postgres:5432/sentinel
+    depends_on:
+      runtime-role:
+        condition: service_completed_successfully
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel_app:${APP_DB_PASSWORD}@postgres:5432/sentinel
+      REDIS_URL: redis://redis:6379/0
+      SENTINEL_SECRET_KEY: ${SENTINEL_SECRET_KEY:?Set SENTINEL_SECRET_KEY}
+      COOKIE_SECURE: "true"
+      API_SENTINEL_KEY: ${API_SENTINEL_KEY:-}
+      SENTINEL_COLLECTOR_URL: http://api:8000/api/telemetry/batch
+      SENTINEL_REGION: ${SENTINEL_REGION:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["dramatiq", "app.tasks", "--processes", "1", "--threads", "4"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel_app:${APP_DB_PASSWORD}@postgres:5432/sentinel
+      REDIS_URL: redis://redis:6379/0
+      SENTINEL_SECRET_KEY: ${SENTINEL_SECRET_KEY:?Set SENTINEL_SECRET_KEY}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["python", "-m", "app.scheduler"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sentinel_app:${APP_DB_PASSWORD}@postgres:5432/sentinel
+      REDIS_URL: redis://redis:6379/0
+      SENTINEL_SECRET_KEY: ${SENTINEL_SECRET_KEY:?Set SENTINEL_SECRET_KEY}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "${WEB_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sentinel-production-postgres:
+  sentinel-production-redis:

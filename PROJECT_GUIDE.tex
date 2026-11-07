@@ -1,0 +1,575 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=25mm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+\definecolor{ink}{HTML}{18212A}
+\definecolor{teal}{HTML}{147D70}
+\definecolor{codebg}{HTML}{F3F5F7}
+\definecolor{codegray}{HTML}{59636E}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=teal,
+  urlcolor=teal,
+  pdftitle={API Sentinel Project Guide},
+  pdfauthor={API Sentinel Project}
+}
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{API Sentinel}
+\rhead{Project Guide}
+\cfoot{\thepage}
+\titleformat{\section}{\Large\bfseries\color{ink}}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries\color{teal}}{\thesubsection}{0.7em}{}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  commentstyle=\color{codegray},
+  breaklines=true,
+  frame=single,
+  framerule=0pt,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  tabsize=4
+}
+\setlist[itemize]{leftmargin=1.5em}
+\setlist[enumerate]{leftmargin=1.8em}
+
+\title{\Huge\bfseries API Sentinel\\[0.4em]
+\Large Product, Architecture, User Guide, and Security Review}
+\author{Project documentation}
+\date{November 2026}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Executive summary}
+
+\subsection{In everyday language}
+API Sentinel watches the requests handled by an API that a team owns. A small
+middleware component sends request metadata to a central dashboard. The platform
+groups the observations into short time windows, highlights unusual behavior,
+and can open an incident when error, latency, anomaly, or validated model-risk
+signals meet its configured-in-code thresholds. Engineers can attach deployment
+events, sanitized application logs, and recovery notes to help investigate.
+
+It is useful when a team needs more context than a simple ``is the server up?''
+check. It does not guarantee that it can predict every outage, identify a proven
+root cause, or automatically repair production. Its current investigation report
+is evidence-based and deterministic; it does not call an LLM.
+
+\subsection{Technical summary}
+The project is a multi-tenant web application built with FastAPI, PostgreSQL,
+Redis, Dramatiq, React, and TypeScript. A Python ASGI middleware captures
+metadata, batches it asynchronously, and authenticates to the collector with a
+per-service key. PostgreSQL stores telemetry, per-minute feature windows,
+incidents, model versions, logs, deployment events, runbooks, and notification
+delivery state. Scheduled workers analyze organizations and dispatch alert
+deliveries. Scikit-learn and XGBoost provide anomaly and predictive-model
+capabilities; SHAP supplies model attributions. A LangGraph workflow assembles
+an investigation report from retrieved runbooks and correlated evidence.
+
+\begin{quote}
+\textbf{Scope statement.} This guide documents what is implemented in the
+repository as of November 2026 and distinguishes it from proposed future work.
+The project is suitable for local development and a carefully configured
+single-host staging deployment. It has not had a formal penetration test or
+production-scale load certification.
+\end{quote}
+
+\section{Why a user may need it}
+
+A basic uptime checker asks whether a health URL returned a response at one
+moment. API Sentinel records request-level behavior, which can help answer
+questions such as:
+\begin{itemize}
+  \item Did a service begin returning more server errors?
+  \item Did its response latency or traffic pattern change?
+  \item Which open incident is associated with this service?
+  \item Was a deployment recorded shortly before the incident?
+  \item Are there relevant recovery notes in the workspace runbooks?
+\end{itemize}
+
+The people most likely to use it are backend developers, SREs, DevOps engineers,
+and engineering leads who need a shared view of service health and incident
+evidence. It can also help a small team learn the mechanics of telemetry
+collection, tenant isolation, anomaly detection, and incident workflows.
+
+\subsection{Example applications}
+\begin{description}
+  \item[API reliability] Watch server-side latency, request volume, and 5xx
+  responses for FastAPI services.
+  \item[Release investigation] Compare an incident time with deployment events
+  reported by a CI job.
+  \item[Error context] Ingest selected, sanitized error messages and correlate
+  them with an incident.
+  \item[Learning and prototyping] Use the development traffic simulator to
+  explore normal, degrading, cascading-error, and flash-crowd patterns.
+  \item[Workspace operations] Give a small engineering team a tenant-scoped
+  dashboard, incident list, runbooks, and optional Slack notifications.
+\end{description}
+
+\section{Feature status: implemented and future work}
+
+\begin{longtable}{p{0.25\linewidth}p{0.23\linewidth}p{0.44\linewidth}}
+\toprule
+\textbf{Area} & \textbf{Status} & \textbf{Current behavior} \\
+\midrule
+Authentication & Implemented & Email/password registration and sign-in;
+HTTP-only session cookie; workspace owner role. \\
+Tenant separation & Implemented & Organization filters and PostgreSQL row-level
+security on tenant data tables; cross-organization behavior was exercised in
+an isolated end-to-end run. \\
+Telemetry & Implemented & Python FastAPI middleware and service-key ingestion
+endpoints; request/response bodies are not captured. \\
+Feature analysis & Implemented & Per-minute feature windows, anomaly scoring,
+manual analysis endpoint, and optional minute scheduler. \\
+Failure prediction & Implemented with a quality gate & Chronological holdout;
+models remain candidates until the configured validation checks pass. \\
+Incidents & Implemented & Threshold, anomaly, or validated-risk signals can
+create an incident; users can change incident status. \\
+Evidence investigation & Implemented, bounded & Telemetry, ingested logs,
+deployment events, and keyword-matched runbooks are assembled by a LangGraph
+workflow. Correlation is a clue, not causal proof. \\
+Alerts & Implemented, configurable & Slack incoming webhook storage, test
+delivery, queued incident delivery, and bounded retries. A real workspace
+webhook must be supplied by the operator. \\
+External provider sync & Not implemented & CI/CD and hosted log-provider data
+must be posted to the ingestion endpoints by the user's integration. \\
+LLM and vector search & Not implemented & Runbook retrieval is keyword-based;
+there is no connected LLM or pgvector store in the current implementation. \\
+Automated remediation & Not implemented & Investigation reports require human
+review; no production action is executed. \\
+Production hosting & Prepared, not deployed & A single-host Compose deployment
+template exists. Domain, TLS termination, host, secrets, and operational
+ownership must be configured by the operator. \\
+\bottomrule
+\end{longtable}
+
+\section{System architecture}
+
+\subsection{Runtime component view}
+\begin{lstlisting}
+Monitored FastAPI service
+  request -> SentinelMiddleware -> application response
+                  |
+                  +-- bounded in-memory queue, batched HTTP POST
+                           |
+                           v
+                     FastAPI collector <------ browser dashboard
+                           |                         |
+                           v                         v
+                    PostgreSQL <-------------- React + TypeScript
+                           ^
+                           |
+             Dramatiq worker <--- Redis <--- scheduler
+                 |       |
+                 |       +-- Slack webhook delivery
+                 +-- feature analysis, training, incidents
+
+Incident investigation reads telemetry, ingested logs, deployments,
+and workspace runbooks, then returns a human-reviewed evidence report.
+\end{lstlisting}
+
+\subsection{Responsibilities by layer}
+\begin{description}
+  \item[SDK / collection] Measures route template, method, status, duration,
+  content lengths, validated request/trace identifiers, and exception type. It
+  avoids reading request and response bodies and authorization headers.
+  \item[HTTP API] Handles account and workspace operations, service keys,
+  telemetry, logs, deployments, incidents, runbooks, intelligence, and alerts.
+  \item[PostgreSQL] Persists tenant data and serves as the durable source of
+  truth. Telemetry event identifiers and integration event identifiers are
+  deduplicated.
+  \item[Redis / Dramatiq] Holds the background queue and ephemeral scheduling
+  locks and heartbeat values. Redis is not the durable record of incidents.
+  \item[Scheduler] Enqueues analysis and pending alert work every minute and
+  model evaluation daily when enabled.
+  \item[Worker] Processes queued jobs with retry limits and records a heartbeat.
+  \item[Frontend] React and TypeScript UI. Vite proxies API calls in local
+  development; production Nginx serves the SPA and forwards same-origin API
+  paths to FastAPI.
+\end{description}
+
+\subsection{Data ownership and isolation}
+Each service belongs to one organization. Its ingestion key is shown to the
+owner once and stored in PostgreSQL as a SHA-256 hash. Collector calls identify
+the service from the key; the server derives the organization from that service
+record rather than trusting an organization identifier in the event payload.
+User-facing endpoints derive the active organization from the signed-in
+membership. Tenant-owned tables use PostgreSQL row-level security policies in
+addition to application-level organization filters.
+
+The production Compose template creates a runtime database role with
+\texttt{NOSUPERUSER} and \texttt{NOBYPASSRLS}. The local development Compose
+database uses its development owner role and should not be exposed as a
+production database.
+
+\section{End-to-end workflow}
+
+\begin{enumerate}
+  \item An owner creates an account and workspace.
+  \item The owner creates a service and stores the one-time ingestion key in the
+  monitored API's secret environment.
+  \item The middleware observes HTTP metadata and puts events in its bounded
+  asynchronous queue.
+  \item The SDK sends batches to \texttt{/api/telemetry/batch} with the
+  \texttt{X-Sentinel-Key} header. The collector validates the key, deduplicates
+  events, and writes them to PostgreSQL.
+  \item The scheduler queues feature analysis. A user can also run analysis
+  from Intelligence.
+  \item Per-minute observations become feature windows. Anomaly scoring uses
+  Isolation Forest at 30 or more windows and a robust rolling baseline for
+  shorter histories.
+  \item Current error, latency, anomaly, or validated model-risk signals can
+  create an incident. Default implemented thresholds include a 5\% 5xx rate,
+  p95 latency of 1500 ms, anomaly score 0.65, and validated risk score 0.70.
+  These values are implementation defaults, not a user-facing policy editor.
+  \item The investigation workflow can correlate deployment events from the
+  prior 24 hours, application logs around the incident, and matching workspace
+  runbooks. Reports label associations as clues and require human review.
+  \item If a Slack destination is configured, a durable delivery row is queued
+  and the background worker delivers a concise incident message with bounded
+  retries.
+\end{enumerate}
+
+\subsection{Model workflow}
+The failure label asks whether the following ten minutes contain at least a
+5\% 5xx rate or p95 latency of at least 1500 ms. Training uses time-ordered data
+with a temporal purge between training and holdout windows. The classifier is
+kept as a candidate unless enough positive and negative holdout examples exist
+and it beats the configured baseline checks. In the isolated verification run,
+training returned a candidate with 1,439 labeled windows and
+\texttt{needs\_more\_validation\_data}; it was not activated. This is a safe
+model outcome, not a system error.
+
+\section{Tutorial: use the local application}
+
+\subsection{Start the services}
+From the project root, run PostgreSQL and Redis. Start the backend API, worker,
+scheduler, and frontend in separate terminals following these commands:
+
+\begin{lstlisting}[language=bash]
+docker compose up -d postgres redis
+
+cd backend
+.venv/bin/alembic upgrade head
+.venv/bin/uvicorn app.main:app --reload
+# In another backend terminal:
+.venv/bin/dramatiq app.tasks --processes 1 --threads 2
+# In another backend terminal:
+.venv/bin/python -m app.scheduler
+
+# In another terminal from the repository root:
+cd frontend
+npm run dev
+\end{lstlisting}
+
+Open \url{http://localhost:5173}. Register or sign in. In Settings, confirm
+Redis, scheduler, and worker are online.
+
+\subsection{Create and instrument a service}
+Create a service from the Services page and copy its ingestion key. Store the key
+as \texttt{API\_SENTINEL\_KEY} in the monitored API's environment, then install
+the SDK from the repository:
+
+\begin{lstlisting}[language=bash]
+pip install -e /path/to/api-sentinel/sdk-python
+export API_SENTINEL_KEY='paste-the-service-key-in-your-terminal-env'
+\end{lstlisting}
+
+Register the middleware in the monitored FastAPI application's own entry point.
+Do not paste the application setup into the SDK's \texttt{middleware.py} file.
+
+\begin{lstlisting}[language=Python]
+import os
+from fastapi import FastAPI
+from api_sentinel import SentinelMiddleware
+
+app = FastAPI()
+app.add_middleware(
+    SentinelMiddleware,
+    service_key=os.environ["API_SENTINEL_KEY"],
+    collector_url="http://127.0.0.1:8000/api/telemetry/batch",
+)
+\end{lstlisting}
+
+Restart the monitored application and send it requests. For example, API
+Sentinel's local backend is instrumented for self-monitoring when its environment
+contains a valid service key:
+
+\begin{lstlisting}[language=bash]
+curl -i http://127.0.0.1:8000/api/health
+\end{lstlisting}
+
+The middleware transmits metadata in the background. A successful collector
+response is HTTP 202. Collector paths are excluded from instrumentation to avoid
+a telemetry feedback loop. Normal health checks validate ingestion but do not
+usually cause incidents because they return HTTP 200.
+
+\subsection{Analyze, investigate, and alert}
+\begin{enumerate}
+  \item Open the Dashboard and select a time range.
+  \item Open Intelligence and choose \textit{Analyze last 24 hours}.
+  \item Review feature windows, model status, and any created incidents.
+  \item Open an incident and run the investigation. Treat deployment-time
+  correlation as context, not proof of cause.
+  \item Add recovery instructions under Runbooks.
+  \item As a workspace owner, connect a Slack incoming webhook in Settings and
+  use the test-delivery action. Use only a webhook from the intended test
+  workspace when validating.
+\end{enumerate}
+
+\subsection{Synthetic traffic}
+The simulator is for a separate development service. It permanently writes
+events to the selected service and can affect labels and incident history.
+Cascade traffic spread over a 24-hour history may leave the final minute too
+sparse to create an immediate incident. To exercise incident creation reliably,
+send a concentrated burst of failing requests to a disposable service, then run
+analysis. Do not use generated failure traffic in a production workspace.
+
+\section{Evidence and API integration points}
+
+\begin{longtable}{p{0.34\linewidth}p{0.56\linewidth}}
+\toprule
+\textbf{Route} & \textbf{Purpose} \\
+\midrule
+\texttt{POST /api/telemetry} & Ingest one request event using a service key. \\
+\texttt{POST /api/telemetry/batch} & Ingest a batch of up to 100 events. \\
+\texttt{POST /api/deployments} & Ingest one deployment event for incident correlation. \\
+\texttt{POST /api/logs/batch} & Ingest up to 100 selected error/warning log records;
+common credential patterns are redacted before persistence. \\
+\texttt{POST /api/intelligence/analyze} & Analyze recent telemetry for the signed-in workspace. \\
+\texttt{POST /api/intelligence/train} & Train or evaluate the workspace failure model. \\
+\texttt{GET /api/intelligence} & Read model and feature-window summary. \\
+\texttt{POST /api/incidents/\{id\}/investigate} & Create an evidence report for an incident. \\
+\texttt{GET /api/operations/status} & Read Redis, scheduler, and worker status after sign-in. \\
+\bottomrule
+\end{longtable}
+
+All evidence integrations use the service's \texttt{X-Sentinel-Key}. The product
+does not pull data from GitHub, a CI provider, or a hosted log platform by itself;
+those systems must post events to these routes.
+
+\section{Deployment and operations}
+
+\subsection{Prepared single-host deployment}
+The repository includes \texttt{docker-compose.production.yml}, backend and
+frontend Dockerfiles, an Nginx SPA/API proxy, a one-shot restricted-role setup
+service, and a runtime-role migration. The web port is the only published application port;
+PostgreSQL and Redis have no host port mapping. A TLS reverse proxy must sit in
+front of Nginx because the included Nginx configuration serves HTTP only.
+
+Copy \texttt{.env.production.example} to the ignored
+\texttt{.env.production}, generate distinct 32-byte random values for the
+administrator password, runtime database password, and session/encryption key,
+then run:
+
+\begin{lstlisting}[language=bash]
+docker compose --env-file .env.production \\
+  -f docker-compose.production.yml up -d --build
+docker compose --env-file .env.production \\
+  -f docker-compose.production.yml ps
+\end{lstlisting}
+
+The \texttt{sentinel\_app} role is created as a non-superuser without
+\texttt{BYPASSRLS}. Migrations run separately with the administrator role; API
+and worker processes use the restricted role. This template has been syntax
+checked, built, and exercised in an isolated local stack. It still must be
+deployed and checked on the selected host before public launch.
+
+\subsection{Backups and recovery}
+Run \texttt{backend/deploy/backup-production.sh} with a protected off-host
+destination. It creates a PostgreSQL custom-format dump and sets file permissions
+to owner-only. It does not encrypt the file. Encrypt backups at rest, set a
+retention policy, and rehearse a restore into a disposable database. Keep
+PostgreSQL and Redis volumes persistent; Redis queue state can be rebuilt only
+for pending work, while PostgreSQL contains the durable business data.
+
+\subsection{Operational checks}
+\begin{itemize}
+  \item Check \texttt{/api/health} and container health checks.
+  \item Check Settings for Redis, scheduler, and worker heartbeats.
+  \item Review API, worker, scheduler, and reverse-proxy logs.
+  \item Alert on failed health checks, repeated notification failures, disk
+  pressure, and missed backups using the hosting provider's monitoring.
+  \item Restore a backup on a regular schedule and record the recovery time.
+\end{itemize}
+
+The repository does not include an external error-monitoring account, automatic
+backup scheduler, or managed hosting configuration. Those depend on the chosen
+provider and operator credentials.
+
+\section{Security and vulnerability review}
+
+\subsection{Implemented safeguards}
+\begin{itemize}
+  \item Ingestion keys are generated with high entropy and only their SHA-256
+  hashes are stored in the database.
+  \item Browser sessions use HTTP-only cookies, a 12-hour expiration, and
+  SameSite=Lax. Production Compose sets secure cookies; local development does
+  not.
+  \item Tenant data queries use organization filters and row-level security on
+  tenant tables. The production deployment uses a role that cannot bypass RLS.
+  \item The middleware records metadata and does not inspect request/response
+  bodies or authorization headers.
+  \item Log messages are length-limited and common bearer, password, token,
+  secret, and API-key patterns are redacted. This is not a complete sensitive
+  data detector.
+  \item Slack webhook URLs are restricted to the Slack webhook host and
+  encrypted at rest using the configured application secret.
+  \item The production Nginx template limits request body size and sets common
+  browser security headers.
+\end{itemize}
+
+\subsection{Risks and recommended actions}
+\begin{longtable}{p{0.18\linewidth}p{0.29\linewidth}p{0.43\linewidth}}
+\toprule
+\textbf{Priority} & \textbf{Risk} & \textbf{Action before public launch} \\
+\midrule
+High & A service key was previously pasted into source code. The SDK file was
+cleaned and the current key is held in the ignored, mode-600 environment file. &
+Rotate any key that appeared in source control, logs, tickets, or shared chat;
+verify the old key is rejected and the replacement works. Never commit
+\texttt{.env} files. \\
+High & Public registration has no rate limit or email verification; login
+failures are throttled per email in Redis but fail open if Redis is unavailable. &
+Add signup abuse controls, email verification, and monitoring before allowing
+unrestricted public account creation. \\
+High & Production is not yet deployed behind verified TLS and a managed host. &
+Use HTTPS end-to-end at the edge, set \texttt{COOKIE\_SECURE=true}, restrict
+ingress, and configure trusted proxy headers. \\
+Medium & Session tokens are stateless. Clearing the cookie on logout does not
+revoke a copied token before its 12-hour expiry. & Add server-side session
+revocation or shorten the accepted lifetime and document incident response. \\
+Medium & Log redaction uses a small set of regular expressions; arbitrary PII or
+secrets may remain in messages. & Sanitize at the source, minimize log fields,
+and review retention and access before enabling log ingestion. \\
+Medium & The normal Compose template has no automated backup encryption,
+retention, or restore rehearsal. & Encrypt off-host backups, restrict access, and
+prove restore procedures before launch. \\
+Medium & Login failures are limited per email, but registration and general
+ingestion have no distributed rate limit. The 1 MB payload cap is at the Nginx
+edge. & Do not publish the API container directly; add signup abuse controls and
+edge rate limits before internet exposure. \\
+Medium & The app role still reads user and membership tables needed for login
+and workspace selection; not every table has RLS. & Keep queries parameterized,
+maintain explicit tenant filters, and add a focused review of identity-table
+policies before multi-tenant scale-up. \\
+Low & Model scores and investigation correlations can be wrong or incomplete. &
+Keep human review, monitor false positives/negatives, and avoid describing
+correlation as causal proof. \\
+Low & npm reported no known vulnerabilities during the image build, but a
+Python software-composition scan and formal penetration test have not been
+completed. Python transitive packages are not hash-locked. & Run an authenticated
+software-composition scan, lock transitive dependencies, and arrange an
+independent security assessment before handling sensitive production telemetry. \\
+\bottomrule
+\end{longtable}
+
+This is a source-based engineering review, not a penetration test or a guarantee
+that the system is free of vulnerabilities. In this work session the CodeRabbit
+CLI reported an authentication/Git-provider access error after its review
+request was submitted, so no CodeRabbit findings were available. Local review,
+the isolated E2E run, Python compilation, frontend production build, migration,
+and Compose configuration checks were used instead.
+
+\subsection{Threat model at a glance}
+\begin{description}
+  \item[Untrusted telemetry sender] May try a forged or stolen key, duplicate
+  events, or submit oversized data. The collector authenticates a service key,
+  bounds batch length and fields, and deduplicates event IDs; edge request
+  limits are still important.
+  \item[Malicious tenant] May try to access another workspace's records.
+  Organization filters and RLS are tested; production must use the restricted
+  role rather than a superuser.
+  \item[Compromised account] May change workspace settings, create services, or
+  configure outgoing Slack alerts according to role. There is no MFA or email
+  verification in this version.
+  \item[Compromised application secret] Can permit forged sessions and prevent
+  decryption of stored Slack destinations if rotated without a re-encryption
+  plan. Back up and rotate it deliberately.
+  \item[Untrusted log content] May contain credentials or personal information.
+  The server redacts common forms, but the source application remains responsible
+  for data minimization.
+\end{description}
+
+\section{End-to-end verification record}
+
+The recent isolated verification used a separate temporary PostgreSQL database,
+a separate API port, and a separate Redis database index. It exercised:
+\begin{itemize}
+  \item anonymous request rejection, registration, sign-in, and service creation;
+  \item key-required telemetry, valid batch ingestion, and duplicate handling;
+  \item synthetic traffic, feature analysis, and deterministic incident creation;
+  \item deployment and log ingestion, investigation evidence, and secret redaction;
+  \item two organizations seeing only their own services and cross-organization
+  incident mutation returning 404;
+  \item candidate model evaluation and scheduler/worker/Redis heartbeats.
+\end{itemize}
+
+The candidate model remained inactive because the quality gate required stronger
+holdout validation. The test database and its known schedule-lock keys were
+removed afterward; the normal API and frontend remained healthy. Slack delivery
+to a real workspace and browser-driven UI automation were not part of that run.
+
+\section{Glossary}
+\begin{description}
+  \item[API] A program interface accessed over HTTP.
+  \item[Telemetry] Request metadata used to describe service behavior.
+  \item[Ingestion key] A secret assigned to one service so it can report events.
+  \item[Feature window] A set of measurements aggregated for a short time span.
+  \item[Anomaly] A behavior pattern that differs from the measured baseline.
+  \item[Candidate model] A trained model that has not passed the activation gate.
+  \item[Row-level security] PostgreSQL rules that restrict which rows a database
+  role can read or modify in a query.
+  \item[Runbook] Human-written operational steps for diagnosing or recovering
+  from a known problem.
+  \item[MTTR] Mean time to recovery, a common measure of how quickly service is
+  restored after an incident.
+\end{description}
+
+\section{Project file map}
+\begin{longtable}{p{0.42\linewidth}p{0.5\linewidth}}
+\toprule
+\textbf{Path} & \textbf{Role} \\
+\midrule
+\texttt{backend/app/main.py} & HTTP API, authentication, ingestion, and routes. \\
+\texttt{backend/app/operations.py} & Feature analysis, incident creation, and model operations. \\
+\texttt{backend/app/intelligence.py} & Feature engineering, anomaly scoring, and model utilities. \\
+\texttt{backend/app/notifications.py} & Slack message delivery and retry state processing. \\
+\texttt{backend/app/investigation.py} & LangGraph evidence-report workflow. \\
+\texttt{backend/app/scheduler.py} & Minute scheduler and Redis schedule locks. \\
+\texttt{backend/app/tasks.py} & Dramatiq background actors. \\
+\texttt{sdk-python/api\_sentinel/middleware.py} & Monitored-service ASGI middleware. \\
+\texttt{frontend/src/App.tsx} & React pages and user interactions. \\
+\texttt{docker-compose.production.yml} & Single-host deployment template. \\
+\texttt{backend/deploy/backup-production.sh} & PostgreSQL backup helper. \\
+\texttt{backend/migrations/versions} & Database schema history. \\
+\bottomrule
+\end{longtable}
+
+\section{Build this document}
+The source is \texttt{PROJECT\_GUIDE.tex}. With a LaTeX distribution installed,
+compile twice to populate the table of contents:
+
+\begin{lstlisting}[language=bash]
+pdflatex PROJECT_GUIDE.tex
+pdflatex PROJECT_GUIDE.tex
+\end{lstlisting}
+
+The compilation toolchain is not bundled with the application repository.
+
+\end{document}
