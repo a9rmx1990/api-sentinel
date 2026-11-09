@@ -134,6 +134,10 @@ security on tenant data tables; cross-organization behavior was exercised in
 an isolated end-to-end run. \\
 Telemetry & Implemented & Python FastAPI middleware and service-key ingestion
 endpoints; request/response bodies are not captured. \\
+API connection checks & Implemented, active checks & Owners can submit an API URL,
+optional same-host OpenAPI JSON URL, and an auth header. Sentinel encrypts the
+credential, checks the URL and up to eight documented GET routes, and repeats
+checks every five minutes. This is scheduled probing, not passive user traffic. \\
 Feature analysis & Implemented & Per-minute feature windows, anomaly scoring,
 manual analysis endpoint, and optional minute scheduler. \\
 Failure prediction & Implemented with a quality gate & Chronological holdout;
@@ -189,14 +193,15 @@ and workspace runbooks, then returns a human-reviewed evidence report.
   content lengths, validated request/trace identifiers, and exception type. It
   avoids reading request and response bodies and authorization headers.
   \item[HTTP API] Handles account and workspace operations, service keys,
-  telemetry, logs, deployments, incidents, runbooks, intelligence, and alerts.
+  API connection setup, telemetry, logs, deployments, incidents, runbooks,
+  intelligence, and alerts.
   \item[PostgreSQL] Persists tenant data and serves as the durable source of
   truth. Telemetry event identifiers and integration event identifiers are
   deduplicated.
   \item[Redis / Dramatiq] Holds the background queue and ephemeral scheduling
   locks and heartbeat values. Redis is not the durable record of incidents.
-  \item[Scheduler] Enqueues analysis and pending alert work every minute and
-  model evaluation daily when enabled.
+  \item[Scheduler] Enqueues analysis and pending alert work every minute,
+  connected API checks every five minutes, and model evaluation daily.
   \item[Worker] Processes queued jobs with retry limits and records a heartbeat.
   \item[Frontend] React and TypeScript UI. Vite proxies API calls in local
   development; production Nginx serves the SPA and forwards same-origin API
@@ -218,6 +223,14 @@ database uses its development owner role and should not be exposed as a
 production database.
 
 \section{End-to-end workflow}
+
+For code-free checks, an owner can connect an API URL from the Services page.
+Sentinel optionally reads a same-host OpenAPI JSON document, checks the URL and
+up to eight documented GET routes, encrypts the configured auth value, and
+repeats checks every five minutes. These scheduled probes are stored separately
+from request telemetry and do not train the failure model. The SDK workflow
+below remains the path for passive user traffic and application exception
+metadata.
 
 \begin{enumerate}
   \item An owner creates an account and workspace.
@@ -276,6 +289,21 @@ cd backend
 cd frontend
 npm run dev
 \end{lstlisting}
+
+\subsection{Connect an API without installing the SDK}
+Sign in and open \texttt{Services} $\rightarrow$ \texttt{Connect API}. Enter
+the API URL or a specific read-only endpoint. Add an OpenAPI JSON URL to let
+Sentinel discover up to eight GET routes. Select no authentication, a bearer
+token, or an API-key/custom header. Select \texttt{Analyze and connect}; the
+first status and latency checks appear on the Services page. The worker repeats
+checks every five minutes. To monitor private or local targets in a trusted
+development environment, set \texttt{SENTINEL\_ALLOW\_PRIVATE\_API\_TARGETS=true}.
+Keep this disabled on public production deployments.
+
+Sentinel never stores response bodies and does not follow redirects. The API
+credential is encrypted at rest and is not returned to the browser again.
+Active checks observe only the requests Sentinel makes. Use the SDK integration
+below to collect passive user traffic and application exception types.
 
 Open \url{http://localhost:5173}. Register or sign in. In Settings, confirm
 Redis, scheduler, and worker are online.
@@ -425,6 +453,8 @@ provider and operator credentials.
   tenant tables. The production deployment uses a role that cannot bypass RLS.
   \item The middleware records metadata and does not inspect request/response
   bodies or authorization headers.
+  \item Active API checks use GET only, do not follow redirects, do not store
+  response bodies, and encrypt the configured authentication value at rest.
   \item Log messages are length-limited and common bearer, password, token,
   secret, and API-key patterns are redacted. This is not a complete sensitive
   data detector.
@@ -464,6 +494,11 @@ Medium & Login failures are limited per email, but registration and general
 ingestion have no distributed rate limit. The 1 MB payload cap is at the Nginx
 edge. & Do not publish the API container directly; add signup abuse controls and
 edge rate limits before internet exposure. \\
+Medium & The active API connector makes server-side requests to user-supplied
+hosts. DNS is checked before connecting, but the HTTP client does not pin that
+resolved address, leaving a DNS-rebinding risk. & Use an egress proxy or a
+transport that pins validated addresses before opening public self-service
+access. Keep private-target access disabled in production. \\
 Medium & The app role still reads user and membership tables needed for login
 and workspace selection; not every table has RLS. & Keep queries parameterized,
 maintain explicit tenant filters, and add a focused review of identity-table
