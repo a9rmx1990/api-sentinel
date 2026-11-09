@@ -10,6 +10,7 @@ FEATURES = (
     "avg_request_size", "avg_response_size", "rolling_5m_error_rate", "rolling_15m_error_rate",
     "rolling_5m_p95", "rolling_15m_p95",
 )
+MIN_LABEL_EVENTS = 5
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -79,7 +80,7 @@ def _slope(values: list[float]) -> float:
 
 def future_failure_label(window_start: datetime, events) -> int | None:
     future = [event for event in events if window_start < event.timestamp <= window_start + timedelta(minutes=10)]
-    if len(future) < 5:
+    if len(future) < MIN_LABEL_EVENTS:
         return None
     errors = sum(event.status_code >= 500 for event in future) / len(future)
     p95 = percentile([event.latency_ms for event in future], .95)
@@ -88,7 +89,7 @@ def future_failure_label(window_start: datetime, events) -> int | None:
 
 def future_latency_label(window_start: datetime, events) -> float | None:
     future = [event.latency_ms for event in events if window_start < event.timestamp <= window_start + timedelta(minutes=10)]
-    return percentile(future, .95) if len(future) >= 5 else None
+    return percentile(future, .95) if len(future) >= MIN_LABEL_EVENTS else None
 
 
 def predict_failure(features: dict, artifact: dict) -> float:
@@ -166,26 +167,59 @@ def explain_model(features: dict, artifact: dict) -> list[dict]:
     return sorted(items, key=lambda item: abs(item["contribution_log_odds"]), reverse=True)[:5]
 
 
+def assess_training_readiness(windows: list[dict], labels: list[int]) -> dict:
+    usable = [(window, label) for window, label in zip(windows, labels) if label is not None]
+    usable.sort(key=lambda pair: pair[0]["window_start"])
+    positives = sum(label == 1 for _, label in usable)
+    negatives = len(usable) - positives
+    result = {"eligible": False, "reason": "need_more_labeled_windows",
+              "labeled_windows": len(usable), "positive_windows": positives,
+              "negative_windows": negatives, "minimum_labeled_windows": 30,
+              "training_windows": 0, "holdout_windows": 0}
+    if len(usable) < 30:
+        return result
+    if positives == 0 or negatives == 0:
+        result["reason"] = "need_healthy_and_failure_examples"
+        return result
+    split = max(1, int(len(usable) * .8))
+    holdout_start = usable[split][0]["window_start"]
+    train = [item for item in usable[:split] if item[0]["window_start"] < holdout_start - timedelta(minutes=10)]
+    holdout = usable[split:]
+    result.update({"training_windows": len(train), "holdout_windows": len(holdout)})
+    if len(train) < 20 or not holdout:
+        result["reason"] = "need_more_time_history"
+        return result
+    if len({label for _, label in train}) < 2:
+        result["reason"] = "need_healthy_and_failure_examples_in_training_period"
+        return result
+    result.update({"eligible": True, "reason": "ready"})
+    return result
+
+
 def train_failure_model(windows: list[dict], labels: list[int], latency_targets: list[float | None] | None = None):
     """Time-ordered XGBoost classification and optional p95 regression."""
+    readiness = assess_training_readiness(windows, labels)
+    if not readiness["eligible"]:
+        return None, {"status": "insufficient_data", **readiness}
     import numpy as np
     import xgboost as xgb
 
-    usable = [(window, label, (latency_targets or [None] * len(windows))[idx])
+    latency_targets = latency_targets or [None] * len(windows)
+    usable = [(window, label, latency_targets[idx])
               for idx, (window, label) in enumerate(zip(windows, labels)) if label is not None]
-    if len(usable) < 30 or len({label for _, label, _ in usable}) < 2:
-        return None, {"status": "insufficient_data", "labeled_windows": len(usable), "positive_windows": sum(label == 1 for _, label, _ in usable)}
     usable.sort(key=lambda pair: pair[0]["window_start"])
     split = max(1, int(len(usable) * .8))
     holdout_start = usable[split][0]["window_start"]
     train = [item for item in usable[:split] if item[0]["window_start"] < holdout_start - timedelta(minutes=10)]
     holdout = usable[split:]
     if len(train) < 20 or not holdout:
-        return None, {"status": "insufficient_purged_split", "labeled_windows": len(usable), "training_windows": len(train), "holdout_windows": len(holdout)}
+        return None, {"status": "insufficient_data", "reason": "need_more_time_history",
+                      "labeled_windows": len(usable), "training_windows": len(train), "holdout_windows": len(holdout)}
     x_train = [[row["features"].get(key, 0) for key in FEATURES] for row, _, _ in train]
     y_train = [label for _, label, _ in train]
     if len(set(y_train)) < 2:
-        return None, {"status": "insufficient_class_diversity", "labeled_windows": len(usable), "positive_windows": sum(label == 1 for _, label, _ in usable)}
+        return None, {"status": "insufficient_data", "reason": "need_healthy_and_failure_examples_in_training_period",
+                      "labeled_windows": len(usable), "positive_windows": sum(label == 1 for _, label, _ in usable)}
     positives = sum(y_train)
     classifier = xgb.XGBClassifier(n_estimators=100, max_depth=3, learning_rate=.04, subsample=.85,
                                    colsample_bytree=.85, reg_lambda=2, scale_pos_weight=(len(y_train)-positives)/max(positives, 1),
