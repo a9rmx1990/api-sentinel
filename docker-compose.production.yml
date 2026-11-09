@@ -73,6 +73,7 @@ services:
       SENTINEL_COLLECTOR_URL: http://api:8000/api/telemetry/batch
       SENTINEL_REGION: ${SENTINEL_REGION:-}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      SENTINEL_ALLOW_PRIVATE_API_TARGETS: ${SENTINEL_ALLOW_PRIVATE_API_TARGETS:-false}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -94,6 +95,7 @@ services:
       DATABASE_URL: postgresql+asyncpg://sentinel_app:${APP_DB_PASSWORD}@postgres:5432/sentinel
       REDIS_URL: redis://redis:6379/0
       SENTINEL_SECRET_KEY: ${SENTINEL_SECRET_KEY:?Set SENTINEL_SECRET_KEY}
+      SENTINEL_ALLOW_PRIVATE_API_TARGETS: ${SENTINEL_ALLOW_PRIVATE_API_TARGETS:-false}
     depends_on:
       migrate:
         condition: service_completed_successfully
