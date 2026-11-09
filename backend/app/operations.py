@@ -5,8 +5,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.intelligence import (
-    anomaly_scores, explain_model, future_failure_label, future_latency_label,
-    make_feature_windows, predict_failure, train_failure_model,
+    MIN_LABEL_EVENTS, anomaly_scores, assess_training_readiness, explain_model,
+    future_failure_label, future_latency_label, make_feature_windows,
+    predict_failure, train_failure_model,
 )
 from app.models import (
     AlertDestination, FeatureWindow, Incident, ModelVersion, NotificationDelivery,
@@ -95,10 +96,13 @@ async def analyze_organization(session: AsyncSession, organization_id: str, *, l
             "labeled_windows": labeled_windows, "created_incidents": created_incidents}
 
 
-async def train_organization_model(session: AsyncSession, organization_id: str) -> dict:
+async def _training_data(session: AsyncSession, organization_id: str):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24, minutes=10)
     services = list(await session.scalars(select(Service).where(Service.organization_id == organization_id)))
     windows, labels, latency_targets = [], [], []
+    telemetry_events = 0
+    feature_windows = 0
+    too_sparse_windows = 0
     for service in services:
         events = list(await session.scalars(select(Telemetry).where(
             Telemetry.organization_id == organization_id, Telemetry.service_id == service.id,
@@ -109,6 +113,9 @@ async def train_organization_model(session: AsyncSession, organization_id: str) 
             FeatureWindow.service_id == service.id,
             FeatureWindow.window_start >= cutoff + timedelta(minutes=10),
         ).order_by(FeatureWindow.window_start))
+        stored_windows = list(stored_windows)
+        telemetry_events += len(events)
+        feature_windows += len(stored_windows)
         for item in stored_windows:
             window = {"window_start": item.window_start, "features": item.features}
             label = future_failure_label(window["window_start"], events)
@@ -116,9 +123,50 @@ async def train_organization_model(session: AsyncSession, organization_id: str) 
                 windows.append(window)
                 labels.append(label)
                 latency_targets.append(future_latency_label(window["window_start"], events))
+            else:
+                too_sparse_windows += 1
+    readiness = assess_training_readiness(windows, labels)
+    readiness.update({
+        "telemetry_events": telemetry_events,
+        "feature_windows": feature_windows,
+        "windows_without_enough_future_requests": too_sparse_windows,
+        "minimum_future_requests_per_window": MIN_LABEL_EVENTS,
+        "window_horizon_minutes": 10,
+    })
+    if telemetry_events == 0:
+        readiness.update({"eligible": False, "reason": "no_passive_telemetry"})
+        readiness["message"] = "No passive SDK telemetry was collected in the last 24 hours. Active API checks do not train this model; install the SDK or send real request traffic."
+    elif feature_windows == 0:
+        readiness.update({"eligible": False, "reason": "analyze_telemetry_first"})
+        readiness["message"] = "Telemetry exists, but no feature windows have been analyzed. Run Analyze last 24 hours first."
+    elif not windows:
+        readiness.update({"eligible": False, "reason": "need_more_traffic_per_window"})
+        readiness["message"] = f"None of the recent windows has at least {MIN_LABEL_EVENTS} requests in its following 10 minutes. Collect more real API traffic before training."
+    elif not readiness["eligible"] and readiness["reason"] == "need_more_labeled_windows":
+        missing = max(0, readiness["minimum_labeled_windows"] - readiness["labeled_windows"])
+        readiness["message"] = f"Need at least {missing} more labelable windows; training requires 30 windows with both healthy and failure examples."
+    elif not readiness["eligible"] and readiness["reason"] == "need_healthy_and_failure_examples":
+        readiness["message"] = "The data contains only one outcome class. Collect both healthy periods and failure periods before training."
+    elif not readiness["eligible"] and readiness["reason"] == "need_more_time_history":
+        readiness["message"] = "There are not enough time-separated examples after the 10-minute safety gap. Collect a longer history before training."
+    elif not readiness["eligible"] and readiness["reason"] == "need_healthy_and_failure_examples_in_training_period":
+        readiness["message"] = "The training period needs both healthy and failure examples. Collect more varied real traffic."
+    else:
+        readiness["message"] = "Enough labeled telemetry is available for a chronological training and holdout evaluation."
+    return windows, labels, latency_targets, readiness
+
+
+async def get_training_readiness(session: AsyncSession, organization_id: str) -> dict:
+    return (await _training_data(session, organization_id))[3]
+
+
+async def train_organization_model(session: AsyncSession, organization_id: str) -> dict:
+    windows, labels, latency_targets, readiness = await _training_data(session, organization_id)
+    if not readiness["eligible"]:
+        return {**readiness, "status": "insufficient_data", "version_status": None}
     artifact, metrics = train_failure_model(windows, labels, latency_targets)
     if artifact is None:
-        return metrics
+        return {**readiness, **metrics, "version_status": None}
     active = metrics.get("quality_status") == "validated"
     if active:
         versions = await session.scalars(select(ModelVersion).where(
@@ -129,7 +177,9 @@ async def train_organization_model(session: AsyncSession, organization_id: str) 
                            artifact=artifact, metrics=metrics, status="active" if active else "candidate")
     session.add(version)
     await session.commit()
-    return {"model": version.name, "version_status": version.status, **metrics}
+    return {"model": version.name, "version_status": version.status,
+            "message": "Validated model is active." if active else "Candidate saved but held inactive until validation has enough evidence and beats the baseline.",
+            **metrics, "training_readiness": readiness}
 
 
 async def analyze_all_organizations(session: AsyncSession) -> list[dict]:
