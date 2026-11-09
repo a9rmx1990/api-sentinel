@@ -14,19 +14,21 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 from app.db import SessionFactory, engine, set_ingest_key, set_tenant
-from app.models import AlertDestination, ApplicationLog, DeploymentEvent, FeatureWindow, Incident, Investigation, Membership, ModelVersion, Organization, Runbook, Service, Telemetry, User, new_id
+from app.models import AlertDestination, ApiConnection, ApiProbeRun, ApplicationLog, DeploymentEvent, FeatureWindow, Incident, Investigation, Membership, ModelVersion, Organization, Runbook, Service, Telemetry, User, new_id
 from app.intelligence import explain_model, predict_failure, predict_latency
 from app.investigation import investigate
-from app.operations import analyze_organization, train_organization_model
+from app.operations import analyze_organization, get_training_readiness, train_organization_model
 from app.security import create_session_token, decrypt_secret, encrypt_secret, hash_password, read_session_token, verify_password
 from app.notifications import incident_message, post_slack
+from app.probes import analyze_api
+from app.api_monitoring import record_api_connection_check
 
 app = FastAPI(title="API Sentinel", version="0.3.0")
 cors_origins = [
@@ -279,6 +281,102 @@ async def list_services(context=Depends(get_current_user)):
     return [{"id": row.id, "name": row.name, "environment": row.environment, "ingest_key_configured": bool(row.ingest_key_hash)} for row in rows]
 
 
+class ApiConnectionInput(BaseModel):
+    name: str = Field(min_length=2, max_length=120)
+    base_url: str = Field(min_length=8, max_length=2000)
+    openapi_url: str | None = Field(default=None, max_length=2000)
+    auth_header: str | None = Field(default=None, max_length=120)
+    auth_value: str | None = Field(default=None, max_length=2048)
+
+
+def api_connection_view(row: ApiConnection) -> dict:
+    return {"id": row.id, "name": row.name, "base_url": row.base_url,
+            "openapi_url": row.openapi_url, "endpoints": row.endpoints,
+            "last_checks": row.last_checks, "status": row.status,
+            "last_checked_at": row.last_checked_at.isoformat() if row.last_checked_at else None,
+            "created_at": row.created_at.isoformat()}
+
+
+@app.get("/api/connections")
+async def list_api_connections(context=Depends(get_current_user)):
+    rows = await context["session"].scalars(select(ApiConnection).where(
+        ApiConnection.organization_id == context["membership"].organization_id
+    ).order_by(ApiConnection.created_at.desc()))
+    return [api_connection_view(row) for row in rows]
+
+
+@app.post("/api/connections", status_code=201)
+async def connect_api(payload: ApiConnectionInput, context=Depends(get_current_user)):
+    if context["membership"].role != "owner":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only workspace owners can connect APIs")
+    if not payload.name.strip():
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "API name cannot be blank")
+    header = payload.auth_header.strip() if payload.auth_header else None
+    value = payload.auth_value.strip() if payload.auth_value else None
+    if bool(header) != bool(value):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Enter both an auth header name and its value")
+    if header and (not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", header) or
+                   header.lower() in {"host", "connection", "content-length", "transfer-encoding", "cookie"}):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Enter a valid authentication header name")
+    if value and any(char in value for char in "\r\n"):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Authentication value contains invalid characters")
+    try:
+        result = await analyze_api(payload.base_url, payload.openapi_url, header, value)
+    except ValueError as error:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
+    row = ApiConnection(
+        organization_id=context["membership"].organization_id,
+        name=payload.name.strip(), base_url=result["base_url"], openapi_url=result["openapi_url"],
+        auth_header=header, encrypted_auth_value=encrypt_secret(value) if value else None,
+        endpoints=result["endpoints"], last_checks=result["checks"],
+        status=result["status"], last_checked_at=datetime.now(timezone.utc),
+    )
+    context["session"].add(row)
+    await context["session"].flush()
+    await record_api_connection_check(
+        context["session"], row, result["checks"], result["status"],
+        checked_at=row.last_checked_at,
+    )
+    await context["session"].commit()
+    return {**api_connection_view(row), "analysis_note": result["note"]}
+
+
+@app.delete("/api/connections/{connection_id}", status_code=204)
+async def delete_api_connection(connection_id: str, context=Depends(get_current_user)):
+    if context["membership"].role != "owner":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only workspace owners can disconnect APIs")
+    row = await context["session"].scalar(select(ApiConnection).where(
+        ApiConnection.id == connection_id,
+        ApiConnection.organization_id == context["membership"].organization_id,
+    ))
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "API connection not found")
+    await context["session"].delete(row)
+    await context["session"].commit()
+
+
+@app.get("/api/connections/{connection_id}/history")
+async def api_connection_history(
+    connection_id: str,
+    hours: int = Query(default=24, ge=1, le=168),
+    context=Depends(get_current_user),
+):
+    organization_id = context["membership"].organization_id
+    connection = await context["session"].scalar(select(ApiConnection).where(
+        ApiConnection.id == connection_id, ApiConnection.organization_id == organization_id,
+    ))
+    if not connection:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "API connection not found")
+    rows = await context["session"].scalars(select(ApiProbeRun).where(
+        ApiProbeRun.organization_id == organization_id,
+        ApiProbeRun.connection_id == connection_id,
+        ApiProbeRun.checked_at >= datetime.now(timezone.utc) - timedelta(hours=hours),
+    ).order_by(ApiProbeRun.checked_at.desc()).limit(500))
+    return [{"endpoint": row.endpoint, "status_code": row.status_code,
+             "latency_ms": row.latency_ms, "error_type": row.error_type,
+             "checked_at": row.checked_at.isoformat()} for row in rows]
+
+
 class OrganizationInput(BaseModel):
     name: str = Field(min_length=2, max_length=120)
 
@@ -310,6 +408,21 @@ async def create_service(payload: ServiceInput, context=Depends(get_current_user
     session.add(service)
     await session.commit()
     return {"id": service.id, "name": service.name, "environment": service.environment, "ingest_key": ingest_key}
+
+
+@app.delete("/api/services/{service_id}", status_code=204)
+async def delete_service(service_id: str, context=Depends(get_current_user)):
+    if context["membership"].role != "owner":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only workspace owners can delete services")
+    session = context["session"]
+    service = await session.scalar(select(Service).where(
+        Service.id == service_id,
+        Service.organization_id == context["membership"].organization_id,
+    ))
+    if not service:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Service not found")
+    await session.delete(service)
+    await session.commit()
 
 
 def hash_ingest_key(key: str) -> str:
@@ -508,6 +621,7 @@ async def intelligence_summary(context=Depends(get_current_user)):
     return {"updated_at": datetime.now(timezone.utc).isoformat(), "model": model.name if model else None,
             "model_status": "active" if model else latest_model.status if latest_model else "not_trained",
             "model_metrics": display_model.metrics if display_model else {"status": "not_trained"},
+            "training_readiness": await get_training_readiness(session, organization_id),
             "services": scores}
 
 
@@ -602,18 +716,22 @@ async def investigate_incident(incident_id: str, context=Depends(get_current_use
     incident = await session.scalar(select(Incident).where(Incident.id == incident_id, Incident.organization_id == organization_id))
     if not incident:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Incident not found")
-    service = await session.scalar(select(Service).where(Service.id == incident.service_id, Service.organization_id == organization_id))
+    service = await session.scalar(select(Service).where(
+        Service.id == incident.service_id, Service.organization_id == organization_id)) if incident.service_id else None
+    api_connection = await session.scalar(select(ApiConnection).where(
+        ApiConnection.id == incident.api_connection_id, ApiConnection.organization_id == organization_id
+    )) if incident.api_connection_id else None
     docs = list(await session.scalars(select(Runbook).where(Runbook.organization_id == organization_id)))
     deployment_rows = list(await session.scalars(select(DeploymentEvent).where(
         DeploymentEvent.organization_id == organization_id, DeploymentEvent.service_id == incident.service_id,
         DeploymentEvent.deployed_at >= incident.started_at - timedelta(hours=24),
         DeploymentEvent.deployed_at <= incident.started_at,
-    ).order_by(DeploymentEvent.deployed_at.desc()).limit(10)))
+    ).order_by(DeploymentEvent.deployed_at.desc()).limit(10))) if incident.service_id else []
     log_rows = list(await session.scalars(select(ApplicationLog).where(
         ApplicationLog.organization_id == organization_id, ApplicationLog.service_id == incident.service_id,
         ApplicationLog.timestamp >= incident.started_at - timedelta(minutes=30),
         ApplicationLog.timestamp <= incident.started_at + timedelta(minutes=5),
-    ).order_by(ApplicationLog.timestamp.desc()).limit(20)))
+    ).order_by(ApplicationLog.timestamp.desc()).limit(20))) if incident.service_id else []
     deployments = [{"id": row.id, "version": row.version, "commit_sha": row.commit_sha,
                     "environment": row.environment, "deployed_at": row.deployed_at.isoformat(),
                     "minutes_before": max(0, int((incident.started_at - row.deployed_at).total_seconds() / 60))}
@@ -622,7 +740,8 @@ async def investigate_incident(incident_id: str, context=Depends(get_current_use
              "error_type": row.error_type, "message": row.message, "request_id": row.request_id,
              "trace_id": row.trace_id} for row in log_rows]
     evidence = incident.evidence or []
-    report = investigate(title=incident.title, kind=incident.kind, service=service.name if service else "service",
+    report = investigate(title=incident.title, kind=incident.kind,
+                         service=service.name if service else api_connection.name if api_connection else "service",
                          evidence=evidence, runbooks=[{"id": doc.id, "title": doc.title, "body": doc.body} for doc in docs],
                          logs=logs, deployments=deployments, incident_started_at=incident.started_at.isoformat())
     row = Investigation(organization_id=organization_id, incident_id=incident.id, report=report)
@@ -677,11 +796,17 @@ async def dashboard(range_hours: int = Query(default=1, ge=1, le=24), context=De
         start = now - bucket_duration * (bucket + 1)
         end = start + bucket_duration
         traffic.append({"time": start.strftime("%H:%M"), "requests": sum(start <= event.timestamp < end for event in event_rows)})
-    incident_rows = await session.execute(select(Incident, Service.name).join(Service, Service.id == Incident.service_id).where(
+    incident_rows = await session.execute(select(Incident, func.coalesce(Service.name, ApiConnection.name))
+        .outerjoin(Service, Service.id == Incident.service_id)
+        .outerjoin(ApiConnection, ApiConnection.id == Incident.api_connection_id).where(
         Incident.organization_id == organization_id, Incident.status != "resolved").order_by(Incident.started_at.desc()).limit(100))
     incidents = [{"id": incident.id, "title": incident.title, "service": service_name,
                   "severity": incident.severity, "status": incident.status,
                   "started_at": incident.started_at.isoformat()} for incident, service_name in incident_rows]
+    api_connections = list(await session.scalars(select(ApiConnection).where(
+        ApiConnection.organization_id == organization_id,
+        ApiConnection.enabled.is_(True),
+    ).order_by(ApiConnection.name)))
     return {
         "updated_at": now.isoformat(),
         "organization": {"id": context["organization"].id, "name": context["organization"].name},
@@ -693,6 +818,7 @@ async def dashboard(range_hours: int = Query(default=1, ge=1, le=24), context=De
             "active_incidents": len(incidents),
         },
         "traffic": traffic, "services": services, "incidents": incidents,
+        "api_connections": [api_connection_view(row) for row in api_connections],
     }
 
 
