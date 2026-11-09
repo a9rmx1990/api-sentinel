@@ -46,9 +46,9 @@ Run the background worker and minute scheduler in separate terminals from the
 .venv/bin/python -m app.scheduler
 ```
 
-The scheduler enqueues idempotent feature analysis every minute and model
-evaluation once per day. Redis holds the Dramatiq queue; PostgreSQL remains the
-source of truth. The scheduler uses a Redis time-slot lock to prevent duplicate
+The scheduler enqueues feature analysis every minute, connected API checks every
+five minutes, and model evaluation once per day. Redis holds the Dramatiq queue;
+PostgreSQL remains the source of truth. Redis time-slot locks prevent duplicate
 enqueues after a restart.
 
 Start the frontend in another terminal:
@@ -62,8 +62,22 @@ npm run dev
 Open the Vite URL shown in the terminal (normally `http://localhost:5173`). The
 frontend proxies `/api` requests to FastAPI on port 8000.
 
-Create an account and workspace from the sign-in screen, then add a service from
-the Services page. The service creation response reveals its ingestion key once.
+Create an account and workspace from the sign-in screen. To get started without
+changing your API code, open **Services → Connect API**, enter the API name and
+base URL, then optionally add an OpenAPI JSON URL and authentication header.
+Choose **Analyze and connect**. Sentinel checks the base URL, discovers up to
+eight documented GET routes when an OpenAPI document is available, and repeats
+those read-only checks every five minutes while the worker and scheduler run.
+Authentication values are encrypted at rest; response bodies are not stored.
+The connector rejects redirects and URLs containing credentials or query
+parameters. Public targets must use HTTPS. Private or local targets are blocked
+by default; enable `SENTINEL_ALLOW_PRIVATE_API_TARGETS=true` only for a trusted,
+isolated development deployment.
+
+These checks make requests on Sentinel's schedule. They do not see requests from
+your API's users or application-side exceptions. For actual incoming request
+traffic and exception types, add the optional SDK middleware below. From the
+Services page, choose **Add SDK-monitored service**; the key is shown once.
 Install the SDK in the monitored FastAPI application and set that key as
 `API_SENTINEL_KEY`:
 
