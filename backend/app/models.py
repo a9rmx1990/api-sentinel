@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -52,6 +52,35 @@ class Service(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
 
 
+class ApiConnection(Base):
+    __tablename__ = "api_connections"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    base_url: Mapped[str] = mapped_column(String(2000), nullable=False)
+    openapi_url: Mapped[str | None] = mapped_column(String(2000))
+    auth_header: Mapped[str | None] = mapped_column(String(120))
+    encrypted_auth_value: Mapped[str | None] = mapped_column(String(4000))
+    endpoints: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    last_checks: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="checking")
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)
+
+
+class ApiProbeRun(Base):
+    __tablename__ = "api_probe_runs"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    connection_id: Mapped[str] = mapped_column(ForeignKey("api_connections.id", ondelete="CASCADE"), index=True)
+    endpoint: Mapped[str] = mapped_column(String(2000), nullable=False)
+    status_code: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+    error_type: Mapped[str | None] = mapped_column(String(120))
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, index=True)
+
+
 class Telemetry(Base):
     __tablename__ = "telemetry"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
@@ -95,9 +124,14 @@ class ModelVersion(Base):
 
 class Incident(Base):
     __tablename__ = "incidents"
+    __table_args__ = (CheckConstraint(
+        "(service_id IS NOT NULL) <> (api_connection_id IS NOT NULL)",
+        name="ck_incident_one_source",
+    ),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
-    service_id: Mapped[str] = mapped_column(ForeignKey("services.id", ondelete="CASCADE"), index=True)
+    service_id: Mapped[str | None] = mapped_column(ForeignKey("services.id", ondelete="CASCADE"), index=True, nullable=True)
+    api_connection_id: Mapped[str | None] = mapped_column(ForeignKey("api_connections.id", ondelete="CASCADE"), index=True, nullable=True)
     kind: Mapped[str] = mapped_column(String(32), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
