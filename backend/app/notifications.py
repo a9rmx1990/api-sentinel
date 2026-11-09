@@ -1,10 +1,10 @@
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from app.db import SessionFactory, set_tenant
-from app.models import AlertDestination, Incident, NotificationDelivery, Organization, Service
+from app.models import AlertDestination, ApiConnection, Incident, NotificationDelivery, Organization, Service
 from app.security import decrypt_secret
 
 
@@ -33,10 +33,12 @@ async def dispatch_all_pending() -> dict:
         for organization_id in organization_ids:
             await set_tenant(session, organization_id)
             records = (await session.execute(
-                select(NotificationDelivery, AlertDestination, Incident, Service.name)
+                select(NotificationDelivery, AlertDestination, Incident,
+                       func.coalesce(Service.name, ApiConnection.name))
                 .join(AlertDestination, AlertDestination.id == NotificationDelivery.destination_id)
                 .join(Incident, Incident.id == NotificationDelivery.incident_id)
-                .join(Service, Service.id == Incident.service_id)
+                .outerjoin(Service, Service.id == Incident.service_id)
+                .outerjoin(ApiConnection, ApiConnection.id == Incident.api_connection_id)
                 .where(NotificationDelivery.organization_id == organization_id,
                        NotificationDelivery.attempts < 5,
                        or_(NotificationDelivery.status == "pending",
